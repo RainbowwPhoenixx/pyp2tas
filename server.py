@@ -1,14 +1,33 @@
-from collections.abc import Callable
-import time
-import traceback
-import numpy as np
+import errno
+import queue
 import select
 import socket
 import struct
-from enum import Enum
 import threading
-from typing import Any, Callable, List, Callable, Tuple, Dict, Union
-import queue
+import time
+import traceback
+from enum import Enum
+from typing import Any, Callable, Dict, List, Tuple, Union
+
+import numpy as np
+
+
+def remote_connection_closed(sock: socket.socket) -> bool:
+    """
+    Returns True if the remote side did close the connection
+
+    """
+    try:
+        buf = sock.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+        if buf == b'':
+            return True
+    except BlockingIOError as exc:
+        if exc.errno != errno.EAGAIN:
+            # Raise on unknown exception
+            raise
+    except OSError:
+        return True
+    return False
 
 
 class PlaybackState (Enum):
@@ -17,7 +36,7 @@ class PlaybackState (Enum):
     FAST_FORWARD = 2
 
 
-class ServerMessageType (Enum):
+class RecvMessageType (Enum):
     ACTIVE_FILES = 0
     STATE_INACTIVE = 1
     PLAYBACK_RATE = 2
@@ -86,9 +105,15 @@ class EntityInfo:
         return res
 
 
-class TasServer:
+class GameInstanceBase:
+    """
+    Generic building block for the two possible communication scenarios
+    SAR server, this client or
+    SAR client, this server
+    """
 
-    def __init__(self, ip="127.0.0.1", port=6555):
+    def __init__(self):
+        # The socket field should be initialized by the parent class
         self.sock: socket.socket
 
         # Server state
@@ -99,16 +124,12 @@ class TasServer:
         self.debug_tick: int = 0
         self.game_location = ""
 
-        self.ip = ip
-        self.port = port
-
-    def connect(self):
+    def set_sock(self, sock: socket.socket):
         """
-        Initiate a connection to the server
+        Sets this server to communicate with the given socket
+        The purpose of this 
         """
-        self.sock = socket.socket()
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.connect((self.ip, self.port))
+        self.sock = sock
 
     # =============================================================
     #                             Send
@@ -208,6 +229,23 @@ class TasServer:
 
         self.sock.send(packet)
 
+    def entity_info_continuous(self, entity_selector="player"):
+        """
+        Request continuous information on an entity, player is default
+        """
+        packet = b''
+        packet += struct.pack("!B", 101)
+        packet += struct.pack("!I", len(entity_selector))
+        packet += entity_selector.encode()
+
+        self.sock.send(packet)
+
+    def entity_info_continuous_stop(self):
+        """
+        Stop recieving contiuous entity info
+        """
+        self.entity_info_continuous("")
+
     # =============================================================
     #                            Receive
     # =============================================================
@@ -231,9 +269,9 @@ class TasServer:
 
         return entity_info_list
 
-    def recieve_until(self, message_type=ServerMessageType.CURRENT_TICK) -> List[EntityInfo]:
+    def recieve_until(self, message_type=RecvMessageType.CURRENT_TICK) -> List[EntityInfo]:
         """
-        Recieve all pending data and return once a specific packet type is recieved. Data may still be left unread
+        Recieve all pending data and return once a specific packet type is recieved. Data may still be left unread.
         """
         entity_info_list = []
 
@@ -249,47 +287,48 @@ class TasServer:
 
     def __recv_blocking(self):
         ent_info = None
-        msg_type = self.sock.recv(1)
-        msg_type = ServerMessageType(struct.unpack("!B", msg_type)[0])
+        msg_type = self.__recv(1)
+        try:
+            msg_type = RecvMessageType(struct.unpack("!B", msg_type)[0])
+        except:
+            self.sock.close()
+            raise
+        
+        # print(msg_type)
 
-        if msg_type == ServerMessageType.ACTIVE_FILES:
-            len1 = struct.unpack("!I", self.sock.recv(4))[0]
+        if msg_type == RecvMessageType.ACTIVE_FILES:
+            len1 = struct.unpack("!I", self.__recv(4))[0]
             if len1 > 0:
-                self.active_scripts.append(self.sock.recv(len1).decode())
-            len2 = struct.unpack("!I", self.sock.recv(4))[0]
+                self.active_scripts.append(self.__recv(len1).decode())
+            len2 = struct.unpack("!I", self.__recv(4))[0]
             if len2 > 0:
-                self.active_scripts.append(self.sock.recv(len2).decode())
-        elif msg_type == ServerMessageType.STATE_INACTIVE:
+                self.active_scripts.append(self.__recv(len2).decode())
+        elif msg_type == RecvMessageType.STATE_INACTIVE:
             self.active_scripts.clear()
-        elif msg_type == ServerMessageType.PLAYBACK_RATE:
-            self.playback_rate = struct.unpack("!f", self.sock.recv(4))[0]
-        elif msg_type == ServerMessageType.STATE_PLAYING:
+        elif msg_type == RecvMessageType.PLAYBACK_RATE:
+            self.playback_rate = struct.unpack("!f", self.__recv(4))[0]
+        elif msg_type == RecvMessageType.STATE_PLAYING:
             self.state = PlaybackState.PLAYING
-        elif msg_type == ServerMessageType.STATE_PAUSED:
+        elif msg_type == RecvMessageType.STATE_PAUSED:
             self.state = PlaybackState.PAUSED
-        elif msg_type == ServerMessageType.STATE_FAST_FORWARD:
+        elif msg_type == RecvMessageType.STATE_FAST_FORWARD:
             self.state = PlaybackState.FAST_FORWARD
-        elif msg_type == ServerMessageType.CURRENT_TICK:
-            self.current_tick = struct.unpack("!I", self.sock.recv(4))[0]
-        elif msg_type == ServerMessageType.DEBUG_TICK:
-            self.debug_tick = struct.unpack("!i", self.sock.recv(4))[0]
-        elif msg_type == ServerMessageType.PROCESSED_SCRIPT:
+        elif msg_type == RecvMessageType.CURRENT_TICK:
+            self.current_tick = struct.unpack("!I", self.__recv(4))[0]
+        elif msg_type == RecvMessageType.DEBUG_TICK:
+            self.debug_tick = struct.unpack("!i", self.__recv(4))[0]
+        elif msg_type == RecvMessageType.PROCESSED_SCRIPT:
             self.active_scripts.clear()
-            raw_script_len = struct.unpack("!I", self.sock.recv(4))[0]
-            if raw_script_len > 0:
-                # TODO: store the raw somewhere?
-                self.sock.recv(raw_script_len)
-            raw_script_len = struct.unpack("!I", self.sock.recv(4))[0]
-            if raw_script_len > 0:
-                # TODO: store the raw somewhere?
-                self.sock.recv(raw_script_len)
-        elif msg_type == ServerMessageType.ENTITY_INFO:
+            slot = struct.unpack("!B", self.__recv(1))[0]
+            raw_script_len = struct.unpack("!I", self.__recv(4))[0]
+            raw_script = self.__recv(raw_script_len)
+        elif msg_type == RecvMessageType.ENTITY_INFO:
             ent_info = EntityInfo()
-            info_state = struct.unpack("!B", self.sock.recv(1))[0]
+            info_state = struct.unpack("!B", self.__recv(1))[0]
             ent_info.state = info_state != 0
 
             if ent_info.state:  # The rest of the data is present
-                ent_data = struct.unpack("!fffffffff", self.sock.recv(4*9))
+                ent_data = struct.unpack("!fffffffff", self.__recv(4*9))
                 ent_info.x = ent_data[0]
                 ent_info.y = ent_data[1]
                 ent_info.z = ent_data[2]
@@ -300,14 +339,29 @@ class TasServer:
                 ent_info.vy = ent_data[7]
                 ent_info.vz = ent_data[8]
 
-        elif msg_type == ServerMessageType.GAME_LOCATION:
-            str_len = struct.unpack("!I", self.sock.recv(4))[0]
+        elif msg_type == RecvMessageType.GAME_LOCATION:
+            str_len = struct.unpack("!I", self.__recv(4))[0]
             if str_len > 0:
-                self.game_location = self.sock.recv(str_len).decode()
-        else:
-            print("Unkown message!")
+                self.game_location = self.__recv(str_len).decode()
 
         return (msg_type, ent_info)
+
+    def __recv(self, size: int) -> bytes:
+        """
+        Recieve size bytes from the socket and return them. Times out after 25s.
+        """
+        before = time.time()
+        after = time.time()
+
+        buf = b''
+        while len(buf) < size:
+            buf += self.sock.recv(size - len(buf))
+            after = time.time()
+
+            if (after - before) > 25:
+                raise
+
+        return buf
 
     def __str__(self) -> str:
         res = "TasServer: \n"
@@ -320,7 +374,29 @@ class TasServer:
         return res
 
 
-MeasureFn = Callable[[TasServer, List[float]], float]
+class TasServer(GameInstanceBase):
+    def __init__(self, ip="127.0.0.1", port=6555):
+        super().__init__()
+
+        self.ip = ip
+        self.port = port
+
+    def connect(self):
+        """
+        Initiate a connection to the server
+        """
+        self.sock = socket.socket()
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.connect((self.ip, self.port))
+
+
+class TasClient(GameInstanceBase):
+    def __init__(self, sock):
+        super().__init__()
+        self.sock = sock
+
+
+MeasureFn = Callable[[GameInstanceBase, List[float]], float]
 
 
 class ServerPool:
@@ -371,15 +447,17 @@ class ServerHandlerThread(threading.Thread):
         self.game.connect()
 
     def run(self):
-
-        if self.init_script is not None:
-            self.game.recieve()
-            self.game.stop_playback()
-            self.game.fast_forward()  # reset ff
-            time.sleep(0.1)
-            self.game.recieve()
-            self.game.start_content_playback(self.init_script)
-            self.game.recieve_until(ServerMessageType.PROCESSED_SCRIPT)
+        try:
+            if self.init_script is not None:
+                self.game.recieve()
+                if len(self.game.active_scripts) > 0:
+                    self.game.stop_playback()
+                    self.game.recieve_until(RecvMessageType.PROCESSED_SCRIPT)
+                self.game.fast_forward()  # reset ff
+                self.game.start_content_playback(self.init_script)
+                self.game.recieve_until(RecvMessageType.PROCESSED_SCRIPT)
+        except:
+            return
 
         # Run tasks, until the queue is empty
         while True:
@@ -387,7 +465,7 @@ class ServerHandlerThread(threading.Thread):
             try:
                 i, point = self.q.get(False)
             except:
-                break
+                return
 
             # Try to compute the point
             try:
@@ -395,9 +473,122 @@ class ServerHandlerThread(threading.Thread):
             except Exception as e:
                 # In case of failure, put the task back in the queue and exit
                 print(e)
-                print(traceback.format_exc())
+                # print(traceback.format_exc())
                 self.q.put((i, point))
                 self.q.task_done()
-                break
+                return
+
+            self.q.task_done()
+
+
+class ClientPool:
+    def __init__(self, measure: MeasureFn, init: Union[str, None] = None) -> None:
+        self.init_script = init
+        self.measure = measure
+
+        # List of client threads
+        self.clients: Dict[socket._RetAddress, socket.socket] = {}
+
+    def listen(self, port: int):
+        self.sock = socket.socket(socket.AF_INET)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("", port))
+        self.sock.listen(5)
+
+        # Start thread to accept connections
+        threading.Thread(target=self.handle_connections, daemon=True).start()
+
+    def handle_connections(self):
+        while True:  # TODO: better condition, maybe cap the number of clients?
+            conn, addr = self.sock.accept()
+            self.clients[addr] = conn
+            conn.settimeout(20)
+            print(f"Client connected. Total clients: {len(self.clients)}")
+
+    def process_brute(self, points: List[List[float]]) -> Any:
+        results = [float('inf')] * len(points)
+        # Create the point queue
+        q = queue.Queue()
+        for point in enumerate(points):
+            q.put(point)
+
+        # Check all threads are alive. If not, try to start it again
+        threads: Dict[socket.socket, ClientHandlerThread] = {}
+        while q.unfinished_tasks > 0:
+            to_delete = []
+            to_start = []
+
+            items = list(self.clients.items())
+            for addr, conn in items:
+                if remote_connection_closed(conn):
+                    to_delete.append(addr)
+                    continue
+                thread = threads.get(conn)
+                if thread is None or not thread.is_alive():
+                    to_start.append((addr, conn))
+            
+            for addr, conn in to_start:
+                try:
+                    threads[conn] = ClientHandlerThread(
+                        self.init_script, self.measure, conn, q, results)
+                    threads[conn].start()
+                except:
+                    print("Client thread failed to start! Dropping.")
+                    to_delete.append(addr)
+            
+            for addr in to_delete:
+                del self.clients[addr]
+                print(f"Client disconnected. {len(self.clients)} clients left.")
+            
+            time.sleep(10)
+
+        q.join()
+
+        return np.array(results)
+    pass
+
+
+class ClientHandlerThread(threading.Thread):
+    _target: MeasureFn
+
+    def __init__(self, init_script: Union[str, None], target: MeasureFn, sock: socket.socket, queue: queue.Queue, results) -> None:
+        super().__init__(None, target, None, [], None, daemon=True)
+        self.q = queue
+        self.results = results
+        self.init_script = init_script
+        self.game = TasClient(sock)
+
+    def run(self):
+        try:
+            if self.init_script is not None:
+                self.game.recieve()
+                self.game.stop_playback()
+                self.game.fast_forward()  # reset ff
+                time.sleep(0.1)
+                self.game.recieve()
+                self.game.start_content_playback(self.init_script)
+                self.game.recieve_until(RecvMessageType.PROCESSED_SCRIPT)
+        except:
+            print("Client failed to run init script! Retrying.")
+            return
+
+        # Run tasks, until the queue is empty
+        while True:
+            # Get the next task
+            try:
+                i, point = self.q.get(False)
+            except:
+                return
+
+            # Try to compute the point
+            try:
+                self.results[i] = self._target(self.game, point)
+            except Exception as e:
+                # In case of failure, put the task back in the queue and exit
+                print(e)
+                # print(traceback.format_exc())
+                self.q.put((i, point))
+                self.q.task_done()
+                return
 
             self.q.task_done()
